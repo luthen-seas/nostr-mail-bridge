@@ -58,6 +58,9 @@ const SAFE_ATTRIBUTES = new Set([
 export function sanitizeHtml(html: string): string {
   let result = html
 
+  // Step 0: Strip null bytes (bypass prevention)
+  result = result.replace(/\\0/g, '')
+
   // Step 1: Remove dangerous tags and their content entirely
   for (const tag of STRIP_TAGS_WITH_CONTENT) {
     const regex = new RegExp(`<${tag}[^>]*>[\\s\\S]*?</${tag}>`, 'gi')
