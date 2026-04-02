@@ -1,5 +1,5 @@
 // ─── SMTP <-> NOSTR Mail Bridge — Inbound (SMTP -> NOSTR) ──────────────────
-// Receives email via SMTP, converts to NOSTR Mail kind 1111 events, and
+// Receives email via SMTP, converts to NOSTR Mail kind 1400 events, and
 // publishes to recipient's relays via NIP-59 gift wrapping.
 
 import { SMTPServer } from 'smtp-server'
@@ -22,7 +22,7 @@ let smtpServer: SMTPServer | null = null
  * Start the inbound SMTP server.
  *
  * Listens for incoming email, parses MIME, resolves recipients to NOSTR
- * pubkeys via NIP-05, converts to kind 1111 rumors, gift wraps, and publishes
+ * pubkeys via NIP-05, converts to kind 1400 rumors, gift wraps, and publishes
  * to recipient inbox relays.
  *
  * @param config - Bridge configuration.
@@ -120,7 +120,7 @@ export async function stopInboundServer(): Promise<void> {
  */
 async function processInboundEmail(
   rawEmail: Buffer,
-  session: { remoteAddress?: string; envelope?: { mailFrom?: { address?: string }; rcptTo?: Array<{ address?: string }> } },
+  session: { remoteAddress?: string; envelope?: { mailFrom?: false | { address?: string }; rcptTo?: Array<{ address?: string }> } },
   config: BridgeConfig,
   bridgePrivkey: Uint8Array,
   bridgePubkey: string,
@@ -231,7 +231,7 @@ async function processInboundEmail(
       originalHeaders: extractRelevantHeaders(parsed.headers),
     }
 
-    // ── Step 9: Create kind 1111 rumor ────────────────────────────────────
+    // ── Step 9: Create kind 1400 rumor ────────────────────────────────────
     const rumor = mimeToRumor(
       bridgedMessage,
       bridgePubkey,
@@ -279,16 +279,16 @@ async function processInboundEmail(
 // ─── NIP-59 Gift Wrapping ───────────────────────────────────────────────────
 
 /**
- * Seal and gift-wrap a kind 1111 rumor for a recipient.
+ * Seal and gift-wrap a kind 1400 rumor for a recipient.
  *
  * Three-layer NIP-59 encryption:
- * 1. Rumor (kind 1111, unsigned) - the mail content
+ * 1. Rumor (kind 1400, unsigned) - the mail content
  * 2. Seal (kind 13, signed by bridge) - encrypts rumor to recipient
  * 3. Gift Wrap (kind 1059, signed by ephemeral key) - encrypts seal to recipient
  *
  * Timestamps are randomized +/- 2 days.
  *
- * @param rumor - Kind 1111 mail rumor.
+ * @param rumor - Kind 1400 mail rumor.
  * @param senderPrivkey - Bridge private key (32 bytes).
  * @param recipientPubkey - Recipient hex public key.
  * @returns Signed kind 1059 gift wrap event.
@@ -367,7 +367,7 @@ async function uploadToBlossom(
           'Content-Type': mimeType,
           'Content-Length': String(data.length),
         },
-        body: data,
+        body: data as unknown as BodyInit,
         signal: AbortSignal.timeout(60000),
       })
 

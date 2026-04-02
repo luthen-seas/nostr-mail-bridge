@@ -8,7 +8,7 @@ import { getPublicKey, verifyEvent } from 'nostr-tools'
 import * as nip44 from 'nostr-tools/nip44'
 import type { BridgeConfig, MailRumor, OutboundEmail, MimeAttachment } from './types.js'
 import { rumorToMime, buildMimeAttachments } from './convert.js'
-import { resolveNostrToEmail, isBridgeAddress, generateMessageId } from './identity.js'
+import { resolveNostrToEmail, generateMessageId } from './identity.js'
 
 /** Active WebSocket subscriptions. */
 const activeSubscriptions: WebSocket[] = []
@@ -158,7 +158,7 @@ function connectAndSubscribe(
 /**
  * Process a received kind 1059 gift-wrapped event.
  *
- * Decrypts the three NIP-59 layers, extracts the kind 1111 rumor,
+ * Decrypts the three NIP-59 layers, extracts the kind 1400 rumor,
  * checks for email delivery tags, and sends via SMTP if applicable.
  *
  * @param event - The received kind 1059 event.
@@ -177,7 +177,7 @@ async function processGiftWrap(
     sig: string
   },
   bridgePrivkey: Uint8Array,
-  bridgePubkey: string,
+  _bridgePubkey: string,
   config: BridgeConfig,
 ): Promise<void> {
   // ── Step 1: Verify the gift wrap event signature ──────────────────────
@@ -235,7 +235,7 @@ async function processGiftWrap(
     return
   }
 
-  // ── Step 5: Parse the rumor (kind 1111) ─────────────────────────────────
+  // ── Step 5: Parse the rumor (kind 1400) ─────────────────────────────────
   let rumor: MailRumor
   try {
     rumor = JSON.parse(rumorJson)
@@ -244,7 +244,7 @@ async function processGiftWrap(
     return
   }
 
-  if (rumor.kind !== 1111) {
+  if (rumor.kind !== 1400) {
     console.warn(`[outbound] Unexpected rumor kind: ${rumor.kind}, expected 15`)
     return
   }

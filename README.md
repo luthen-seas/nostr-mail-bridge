@@ -1,6 +1,6 @@
 # NOSTR Mail Bridge — SMTP <-> NOSTR Gateway
 
-Bidirectional bridge between email (SMTP/MIME) and NOSTR Mail (kind 1111 events with NIP-59 gift wrapping).
+Bidirectional bridge between email (SMTP/MIME) and NOSTR Mail (kind 1400 events with NIP-59 gift wrapping).
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Bidirectional bridge between email (SMTP/MIME) and NOSTR Mail (kind 1111 events 
   └──────────┘     │  3. Resolve recipient (NIP-05)      │     └──────────┘
                     │  4. HTML -> Markdown                 │
                     │  5. Attachments -> Blossom upload    │
-                    │  6. Build kind 1111 rumor              │
+                    │  6. Build kind 1400 rumor              │
                     │  7. NIP-59 gift wrap                 │
                     │  8. Publish to inbox relays          │
                     └─────────────────────────────────────┘
@@ -118,16 +118,16 @@ _dmarc.bridge.example.com.  IN  TXT  "v=DMARC1; p=reject; rua=mailto:dmarc@bridg
 4. Evaluates SPF/DKIM/DMARC from `Authentication-Results` header
 5. Resolves recipient email to NOSTR pubkey via NIP-05 lookup
 6. Converts HTML body to Markdown; uploads attachments to Blossom
-7. Builds kind 1111 rumor with bridge provenance tags
+7. Builds kind 1400 rumor with bridge provenance tags
 8. Gift wraps (NIP-59 three-layer encryption) for each recipient
 9. Publishes kind 1059 events to recipient's inbox relays
 
 ### Outbound Flow (NOSTR -> Email)
 
-1. NOSTR user creates a kind 1111 mail with `["email-to", "user@example.com"]` tag
+1. NOSTR user creates a kind 1400 mail with `["email-to", "user@example.com"]` tag
 2. Gift wraps and publishes to bridge's pubkey
 3. Bridge subscribes to kind 1059 events tagged with its pubkey
-4. Decrypts three NIP-59 layers to extract the kind 1111 rumor
+4. Decrypts three NIP-59 layers to extract the kind 1400 rumor
 5. Checks for `email-to` tags indicating email delivery
 6. Converts Markdown body to HTML; downloads Blossom attachments
 7. Builds MIME message with proper headers and threading
@@ -183,7 +183,7 @@ npm run test:watch
 - **NIP-44**: Versioned encryption
 - **NIP-59**: Gift wrap (three-layer encryption)
 - **NIP-65**: Relay list metadata (inbox relays)
-- **Kind 1111**: NOSTR Mail message (proposed)
+- **Kind 1400**: NOSTR Mail message (proposed)
 - **Kind 13**: Seal
 - **Kind 1059**: Gift wrap
 
