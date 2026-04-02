@@ -1,5 +1,5 @@
 // ─── SMTP <-> NOSTR Mail Bridge — Conversion Utilities ──────────────────────
-// Bidirectional conversion between MIME email and NOSTR Mail kind 15 rumors.
+// Bidirectional conversion between MIME email and NOSTR Mail kind 1111 rumors.
 // Handles: HTML<->Markdown, threading mapping, attachment extraction/building.
 
 import type { ParsedMail, Attachment as ParsedAttachment } from 'mailparser'
@@ -200,7 +200,7 @@ ${html}
 // ─── MIME <-> Rumor Conversion ──────────────────────────────────────────────
 
 /**
- * Convert a parsed MIME email to a kind 15 NOSTR Mail rumor.
+ * Convert a parsed MIME email to a kind 1111 NOSTR Mail rumor.
  *
  * Maps MIME fields to NOSTR Mail tags:
  * - Subject -> ["subject", ...]
@@ -216,7 +216,7 @@ ${html}
  * @param recipientMappings - Map of email -> {pubkey, relay} for resolved recipients.
  * @param attachmentHashes - Map of filename -> {hash, size} for uploaded Blossom files.
  * @param threadMapping - Optional threading info from email Message-ID resolution.
- * @returns Kind 15 rumor ready for gift wrapping.
+ * @returns Kind 1111 rumor ready for gift wrapping.
  */
 export function mimeToRumor(
   message: BridgedMessage,
@@ -278,7 +278,7 @@ export function mimeToRumor(
   tags.push(['client', 'NostrMail-Bridge/0.1.0'])
 
   return {
-    kind: 15,
+    kind: 1111,
     pubkey: senderPubkey,
     created_at: Math.floor(Date.now() / 1000),
     tags,
@@ -287,7 +287,7 @@ export function mimeToRumor(
 }
 
 /**
- * Convert a kind 15 NOSTR Mail rumor to an outbound email message.
+ * Convert a kind 1111 NOSTR Mail rumor to an outbound email message.
  *
  * Maps NOSTR Mail tags back to MIME headers and structure:
  * - ["subject", ...] -> Subject header
@@ -295,7 +295,7 @@ export function mimeToRumor(
  * - ["attachment", ...] -> MIME attachments (after Blossom download)
  * - ["reply", ...] / ["thread", ...] -> In-Reply-To/References headers
  *
- * @param rumor - Kind 15 NOSTR Mail rumor.
+ * @param rumor - Kind 1111 NOSTR Mail rumor.
  * @param emailRecipients - Map of pubkey -> email address for resolved recipients.
  * @param senderEmail - Bridge email address for the sender.
  * @param senderName - Display name for the sender.

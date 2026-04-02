@@ -121,9 +121,9 @@ export interface ConversionResult<T = unknown> {
   warnings: string[]
 }
 
-/** NOSTR Mail rumor structure (kind 15, unsigned). */
+/** NOSTR Mail rumor structure (kind 1111, unsigned). */
 export interface MailRumor {
-  kind: 15
+  kind: 1111
   pubkey: string
   created_at: number
   tags: string[][]

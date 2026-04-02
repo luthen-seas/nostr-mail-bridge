@@ -158,7 +158,7 @@ function connectAndSubscribe(
 /**
  * Process a received kind 1059 gift-wrapped event.
  *
- * Decrypts the three NIP-59 layers, extracts the kind 15 rumor,
+ * Decrypts the three NIP-59 layers, extracts the kind 1111 rumor,
  * checks for email delivery tags, and sends via SMTP if applicable.
  *
  * @param event - The received kind 1059 event.
@@ -235,7 +235,7 @@ async function processGiftWrap(
     return
   }
 
-  // ── Step 5: Parse the rumor (kind 15) ─────────────────────────────────
+  // ── Step 5: Parse the rumor (kind 1111) ─────────────────────────────────
   let rumor: MailRumor
   try {
     rumor = JSON.parse(rumorJson)
@@ -244,7 +244,7 @@ async function processGiftWrap(
     return
   }
 
-  if (rumor.kind !== 15) {
+  if (rumor.kind !== 1111) {
     console.warn(`[outbound] Unexpected rumor kind: ${rumor.kind}, expected 15`)
     return
   }
