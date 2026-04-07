@@ -326,6 +326,9 @@ async function giftWrapRumor(
     content: encryptedSeal,
   }, ephemeralPrivkey)
 
+  // Zero ephemeral key material after use (DEC-014)
+  ephemeralPrivkey.fill(0)
+
   return wrap
 }
 

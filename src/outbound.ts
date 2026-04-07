@@ -245,7 +245,13 @@ async function processGiftWrap(
   }
 
   if (rumor.kind !== 1400) {
-    console.warn(`[outbound] Unexpected rumor kind: ${rumor.kind}, expected 15`)
+    console.warn(`[outbound] Unexpected rumor kind: ${rumor.kind}, expected 1400`)
+    return
+  }
+
+  // Verify sender consistency (DEC-012): rumor.pubkey must match seal.pubkey
+  if (rumor.pubkey !== senderPubkey) {
+    console.warn(`[outbound] Sender mismatch: rumor.pubkey ${rumor.pubkey} !== seal.pubkey ${senderPubkey}`)
     return
   }
 
