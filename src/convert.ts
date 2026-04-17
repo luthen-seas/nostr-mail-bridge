@@ -11,6 +11,16 @@ import type {
   OutboundEmail,
 } from './types.js'
 import { sanitizeHtml, stripHtml } from './sanitize.js'
+import {
+  formatMailboxAddress,
+  isSafeHex64,
+  sanitizeEmailAddress,
+  sanitizeFilename,
+  sanitizeHeaderValue,
+  sanitizeMessageId,
+  sanitizeMimeType,
+  sanitizeHttpUrl,
+} from './security.js'
 
 // ─── HTML <-> Markdown Conversion ───────────────────────────────────────────
 
@@ -224,6 +234,10 @@ export function mimeToRumor(
   attachmentHashes: Map<string, { hash: string; size: number }>,
   threadMapping?: { replyTo?: string; threadRoot?: string },
 ): MailRumor {
+  if (!isSafeHex64(senderPubkey)) {
+    throw new Error('Invalid sender pubkey')
+  }
+
   const tags: string[][] = []
 
   // Recipient tags
@@ -243,7 +257,7 @@ export function mimeToRumor(
 
   // Subject
   if (message.subject) {
-    tags.push(['subject', message.subject])
+    tags.push(['subject', sanitizeHeaderValue(message.subject, 512)])
   }
 
   // Content type
@@ -266,7 +280,7 @@ export function mimeToRumor(
   }
 
   // Bridge provenance tags
-  tags.push(['bridged-from', 'smtp', message.fromEmail])
+  tags.push(['bridged-from', 'smtp', sanitizeEmailAddress(message.fromEmail) ?? 'unknown'])
   tags.push(['bridged-auth',
     `spf=${message.authResults.spf}`,
     `dkim=${message.authResults.dkim}`,
@@ -309,8 +323,12 @@ export function rumorToMime(
   downloadedAttachments: MimeAttachment[],
 ): OutboundEmail {
   // Extract tags
-  const subject = getTagValue(rumor.tags, 'subject') ?? '(no subject)'
-  const contentType = getTagValue(rumor.tags, 'content-type') ?? 'text/plain'
+  const subject = sanitizeHeaderValue(getTagValue(rumor.tags, 'subject') ?? '(no subject)', 512)
+  const contentType = sanitizeMimeType(getTagValue(rumor.tags, 'content-type'), 'text/plain')
+  const safeSenderEmail = sanitizeEmailAddress(senderEmail)
+  if (!safeSenderEmail) {
+    throw new Error('Invalid sender email')
+  }
 
   // Map recipients
   const toAddresses: string[] = []
@@ -319,15 +337,16 @@ export function rumorToMime(
   for (const tag of rumor.tags) {
     if (tag[0] !== 'p') continue
     const pubkey = tag[1]
-    if (!pubkey) continue
+    if (!isSafeHex64(pubkey)) continue
     const role = tag[3] ?? 'to'
     const email = emailRecipients.get(pubkey)
-    if (!email) continue
+    const sanitizedEmail = sanitizeEmailAddress(email)
+    if (!sanitizedEmail) continue
 
     if (role === 'cc') {
-      ccAddresses.push(email)
+      ccAddresses.push(sanitizedEmail)
     } else {
-      toAddresses.push(email)
+      toAddresses.push(sanitizedEmail)
     }
   }
 
@@ -353,11 +372,13 @@ export function rumorToMime(
   )
 
   // Build Message-ID from event rumor timestamp + pubkey (deterministic)
+  if (!isSafeHex64(rumor.pubkey)) {
+    throw new Error('Invalid rumor pubkey')
+  }
+
   const messageId = `<${rumor.created_at}.${rumor.pubkey.slice(0, 16)}@nostr-bridge>`
 
-  const fromAddress = senderName
-    ? `"${senderName}" <${senderEmail}>`
-    : senderEmail
+  const fromAddress = formatMailboxAddress(safeSenderEmail, senderName) ?? safeSenderEmail
 
   return {
     from: fromAddress,
@@ -405,14 +426,19 @@ export async function threadingEmailToNostr(
 
   // In-Reply-To maps to the ["reply", ...] tag (direct parent)
   if (inReplyTo) {
-    replyTo = await resolveMessageId(inReplyTo)
+    const normalizedReply = sanitizeMessageId(inReplyTo)
+    if (normalizedReply) {
+      replyTo = await resolveMessageId(normalizedReply)
+    }
   }
 
   // First Reference is typically the thread root
   if (references && references.length > 0) {
-    const firstRef = references[0]
-    if (firstRef) {
-      threadRoot = await resolveMessageId(firstRef)
+    for (const reference of references) {
+      const normalizedReference = sanitizeMessageId(reference)
+      if (!normalizedReference) continue
+      threadRoot = await resolveMessageId(normalizedReference)
+      if (threadRoot) break
     }
   }
 
@@ -441,15 +467,15 @@ export function threadingNostrToEmail(
   let inReplyTo: string | undefined
   let references: string | undefined
 
-  if (replyEventId) {
+  if (isSafeHex64(replyEventId)) {
     inReplyTo = `<${replyEventId}@nostr>`
   }
 
   const refs: string[] = []
-  if (threadEventId) {
+  if (isSafeHex64(threadEventId)) {
     refs.push(`<${threadEventId}@nostr>`)
   }
-  if (replyEventId && replyEventId !== threadEventId) {
+  if (isSafeHex64(replyEventId) && replyEventId !== threadEventId) {
     refs.push(`<${replyEventId}@nostr>`)
   }
 
@@ -478,10 +504,10 @@ export function extractAttachments(parsedMail: ParsedMail): BufferAttachment[] {
 
   for (const att of parsedMail.attachments) {
     attachments.push({
-      filename: att.filename ?? `attachment-${attachments.length + 1}`,
-      mimeType: att.contentType ?? 'application/octet-stream',
+      filename: sanitizeFilename(att.filename, `attachment-${attachments.length + 1}`),
+      mimeType: sanitizeMimeType(att.contentType),
       data: new Uint8Array(att.content),
-      contentId: att.contentId ?? undefined,
+      contentId: att.contentId ? sanitizeHeaderValue(att.contentId, 255) : undefined,
       inline: att.contentDisposition === 'inline',
     })
   }
@@ -509,16 +535,19 @@ export async function buildMimeAttachments(
     if (tag[0] !== 'attachment') continue
 
     const hash = tag[1]
-    const filename = tag[2] ?? 'attachment'
-    const mimeType = tag[3] ?? 'application/octet-stream'
+    const filename = sanitizeFilename(tag[2], 'attachment')
+    const mimeType = sanitizeMimeType(tag[3])
 
-    if (!hash) continue
+    if (!isSafeHex64(hash)) continue
 
     // Try each Blossom server until we get the file
     let data: Uint8Array | null = null
     for (const baseUrl of blossomUrls) {
       try {
-        const url = `${baseUrl.replace(/\/$/, '')}/${hash}`
+        const safeBase = sanitizeHttpUrl(baseUrl)
+        if (!safeBase) continue
+
+        const url = `${safeBase}/${hash}`
         const response = await fetch(url, { signal: AbortSignal.timeout(30000) })
         if (response.ok) {
           data = new Uint8Array(await response.arrayBuffer())

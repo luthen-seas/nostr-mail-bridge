@@ -7,6 +7,13 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools'
 import type { BridgeConfig } from './types.js'
 import { startInboundServer, stopInboundServer } from './inbound.js'
 import { startOutboundSubscriber, stopOutboundSubscriber } from './outbound.js'
+import {
+  parseHexBytes,
+  sanitizeDomainName,
+  sanitizeHeaderValue,
+  sanitizeHttpUrl,
+  sanitizeWebSocketUrl,
+} from './security.js'
 
 /** Health-check HTTP server. */
 let healthServer: http.Server | null = null
@@ -40,7 +47,10 @@ let startTime: number = 0
  * @returns Validated BridgeConfig.
  */
 function loadConfig(): BridgeConfig {
-  const domain = requireEnv('BRIDGE_DOMAIN')
+  const domain = sanitizeDomainName(requireEnv('BRIDGE_DOMAIN'))
+  if (!domain) {
+    throw new Error('BRIDGE_DOMAIN must be a valid DNS hostname')
+  }
 
   // Generate a keypair if not provided (dev mode)
   let privateKeyHex = process.env['BRIDGE_PRIVATE_KEY'] ?? ''
@@ -49,17 +59,21 @@ function loadConfig(): BridgeConfig {
     privateKeyHex = Buffer.from(sk).toString('hex')
     console.log('[config] No BRIDGE_PRIVATE_KEY set, generated ephemeral keypair')
     console.log(`[config] Bridge pubkey: ${getPublicKey(sk)}`)
+  } else {
+    parseHexBytes(privateKeyHex)
   }
 
   const relays = (process.env['NOSTR_RELAYS'] ?? 'wss://relay.damus.io,wss://nos.lol,wss://relay.nostr.band')
     .split(',')
     .map(r => r.trim())
-    .filter(Boolean)
+    .map(r => sanitizeWebSocketUrl(r))
+    .filter((r): r is string => typeof r === 'string')
 
   const blossomServers = (process.env['BLOSSOM_SERVERS'] ?? 'https://blossom.primal.net')
     .split(',')
     .map(s => s.trim())
-    .filter(Boolean)
+    .map(s => sanitizeHttpUrl(s))
+    .filter((s): s is string => typeof s === 'string')
 
   const outboundAuth = process.env['OUTBOUND_SMTP_USER']
     ? {
@@ -72,9 +86,9 @@ function loadConfig(): BridgeConfig {
     smtpPort: parseInt(process.env['SMTP_PORT'] ?? '2525', 10),
     smtpSubmissionPort: parseInt(process.env['SMTP_SUBMISSION_PORT'] ?? '587', 10),
     domain,
-    hostname: process.env['BRIDGE_HOSTNAME'] ?? domain,
+    hostname: sanitizeDomainName(process.env['BRIDGE_HOSTNAME'] ?? domain) ?? domain,
     dkimPrivateKey: process.env['DKIM_PRIVATE_KEY'] ?? '',
-    dkimSelector: process.env['DKIM_SELECTOR'] ?? 'default',
+    dkimSelector: sanitizeHeaderValue(process.env['DKIM_SELECTOR'] ?? 'default', 128),
     relays,
     bridgePrivateKeyHex: privateKeyHex,
     blossomServers,
@@ -112,7 +126,7 @@ function requireEnv(name: string): string {
 function startHealthServer(config: BridgeConfig): void {
   healthServer = http.createServer((_req, res) => {
     const uptime = Math.floor((Date.now() - startTime) / 1000)
-    const bridgePubkey = getPublicKey(hexToBytes(config.bridgePrivateKeyHex))
+    const bridgePubkey = getPublicKey(parseHexBytes(config.bridgePrivateKeyHex))
 
     const status = {
       status: 'healthy',
@@ -175,7 +189,7 @@ async function main(): Promise<void> {
     const config = loadConfig()
     startTime = Date.now()
 
-    const bridgePubkey = getPublicKey(hexToBytes(config.bridgePrivateKeyHex))
+    const bridgePubkey = getPublicKey(parseHexBytes(config.bridgePrivateKeyHex))
     console.log(`[config] Domain: ${config.domain}`)
     console.log(`[config] Bridge pubkey: ${bridgePubkey}`)
     console.log(`[config] Relays: ${config.relays.join(', ')}`)
@@ -196,17 +210,6 @@ async function main(): Promise<void> {
     console.error('[bridge] Fatal startup error:', err)
     process.exit(1)
   }
-}
-
-/**
- * Convert a hex string to Uint8Array.
- */
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  return bytes
 }
 
 // ── Run ──────────────────────────────────────────────────────────────────────

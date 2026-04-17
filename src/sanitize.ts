@@ -35,7 +35,6 @@ const URL_ATTRIBUTES = new Set(['href', 'src', 'action', 'formaction', 'poster',
 const SAFE_ATTRIBUTES = new Set([
   'href', 'src', 'alt', 'title', 'class', 'id',
   'width', 'height', 'colspan', 'rowspan', 'scope',
-  'target', 'rel',
 ])
 
 /**
@@ -58,10 +57,7 @@ const SAFE_ATTRIBUTES = new Set([
 export function sanitizeHtml(html: string): string {
   let result = html
 
-  // Step 0: Strip null bytes (bypass prevention)
-  result = result.replace(/\\0/g, '')
-
-  // Step 1: Remove dangerous tags and their content entirely
+  // Phase 1: Remove dangerous tags and their content entirely
   for (const tag of STRIP_TAGS_WITH_CONTENT) {
     const regex = new RegExp(`<${tag}[^>]*>[\\s\\S]*?</${tag}>`, 'gi')
     result = result.replace(regex, '')
@@ -70,10 +66,10 @@ export function sanitizeHtml(html: string): string {
     result = result.replace(selfClose, '')
   }
 
-  // Step 2: Remove HTML comments (can contain conditional IE directives)
+  // Phase 2: Remove HTML comments (can contain conditional IE directives)
   result = result.replace(/<!--[\s\S]*?-->/g, '')
 
-  // Step 3: Process remaining tags
+  // Phase 3: Process remaining tags
   result = result.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)?\/?>/g, (match, tagName: string, attrs: string | undefined) => {
     const tag = tagName.toLowerCase()
 
@@ -133,14 +129,10 @@ function sanitizeAttributes(tag: string, attrString: string): string {
     }
   }
 
-  // For anchor tags, ensure rel="noopener noreferrer" and target="_blank"
+  // For anchor tags, force safe navigation attributes.
   if (tag === 'a') {
-    if (!attrs.some(a => a.startsWith('rel='))) {
-      attrs.push('rel="noopener noreferrer"')
-    }
-    if (!attrs.some(a => a.startsWith('target='))) {
-      attrs.push('target="_blank"')
-    }
+    attrs.push('rel="noopener noreferrer"')
+    attrs.push('target="_blank"')
   }
 
   return attrs.join(' ')
@@ -155,23 +147,28 @@ function sanitizeAttributes(tag: string, attrString: string): string {
 function sanitizeUrl(url: string): string | null {
   const trimmed = url.trim()
 
-  // Allow relative URLs (no scheme)
-  if (!trimmed.includes(':')) return trimmed
-
   // Decode HTML entities and normalize
   const decoded = trimmed
     .replace(/&#x([0-9a-f]+);/gi, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_m, dec: string) => String.fromCharCode(parseInt(dec, 10)))
     .replace(/\s+/g, '') // Remove whitespace that could obfuscate schemes
 
-  // Extract scheme
-  const colonIndex = decoded.indexOf(':')
-  if (colonIndex === -1) return trimmed
+  // Reject protocol-relative or scheme-less URLs. In bridge-rendered HTML we
+  // only allow explicit safe schemes.
+  if (!decoded.includes(':')) return null
+  if (decoded.startsWith('//')) return null
 
-  const scheme = decoded.slice(0, colonIndex + 1).toLowerCase()
+  let parsed: URL
+  try {
+    parsed = new URL(decoded)
+  } catch {
+    return null
+  }
+
+  const scheme = parsed.protocol.toLowerCase()
 
   if (DENIED_URL_SCHEMES.has(scheme)) return null
-  if (ALLOWED_URL_SCHEMES.has(scheme)) return trimmed
+  if (ALLOWED_URL_SCHEMES.has(scheme)) return parsed.toString()
 
   // Unknown scheme — deny by default
   return null

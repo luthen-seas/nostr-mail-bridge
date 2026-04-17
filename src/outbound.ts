@@ -9,6 +9,12 @@ import * as nip44 from 'nostr-tools/nip44'
 import type { BridgeConfig, MailRumor, OutboundEmail, MimeAttachment } from './types.js'
 import { rumorToMime, buildMimeAttachments } from './convert.js'
 import { resolveNostrToEmail, generateMessageId } from './identity.js'
+import {
+  isSafeHex64,
+  parseHexBytes,
+  sanitizeEmailAddress,
+  sanitizeHttpUrl,
+} from './security.js'
 
 /** Active WebSocket subscriptions. */
 const activeSubscriptions: WebSocket[] = []
@@ -29,7 +35,7 @@ let transport: Transporter | null = null
  * @param config - Bridge configuration.
  */
 export function startOutboundSubscriber(config: BridgeConfig): void {
-  const bridgePrivkey = hexToBytes(config.bridgePrivateKeyHex)
+  const bridgePrivkey = parseHexBytes(config.bridgePrivateKeyHex)
   const bridgePubkey = getPublicKey(bridgePrivkey)
 
   // Initialize SMTP transport for outbound sending
@@ -224,6 +230,10 @@ async function processGiftWrap(
   }
 
   const senderPubkey = seal.pubkey
+  if (!isSafeHex64(senderPubkey)) {
+    console.warn('[outbound] Seal pubkey is not a valid hex key')
+    return
+  }
 
   // ── Step 4: Decrypt seal layer to get the rumor ───────────────────────
   let rumorJson: string
@@ -249,9 +259,10 @@ async function processGiftWrap(
     return
   }
 
-  // Verify sender consistency (DEC-012): rumor.pubkey must match seal.pubkey
-  if (rumor.pubkey !== senderPubkey) {
-    console.warn(`[outbound] Sender mismatch: rumor.pubkey ${rumor.pubkey} !== seal.pubkey ${senderPubkey}`)
+  // Verify sender consistency (DEC-012): rumor.pubkey must be a valid hex key
+  // AND must match seal.pubkey.
+  if (!isSafeHex64(rumor.pubkey) || rumor.pubkey !== senderPubkey) {
+    console.warn('[outbound] Refusing rumor with mismatched or invalid sender pubkey')
     return
   }
 
@@ -265,8 +276,9 @@ async function processGiftWrap(
   }
 
   const emailRecipients = emailToTags
-    .map(t => t[1])
+    .map(t => sanitizeEmailAddress(t[1]))
     .filter((addr): addr is string => typeof addr === 'string')
+    .filter((addr, index, array) => array.indexOf(addr) === index)
 
   if (emailRecipients.length === 0) {
     console.warn('[outbound] email-to tags present but no valid addresses')
@@ -285,11 +297,10 @@ async function processGiftWrap(
   for (const tag of rumor.tags) {
     if (tag[0] !== 'p') continue
     const pk = tag[1]
-    if (!pk) continue
-    // Check if any email-to tags match this recipient
-    const emailTag = emailToTags.find(t => t[1])
-    if (emailTag?.[1]) {
-      pubkeyToEmail.set(pk, emailTag[1])
+    if (!isSafeHex64(pk)) continue
+    const mappedEmail = resolveNostrToEmail(pk, config.domain)
+    if (mappedEmail) {
+      pubkeyToEmail.set(pk, mappedEmail)
     }
   }
 
@@ -304,7 +315,11 @@ async function processGiftWrap(
   // ── Step 9: Download attachments from Blossom ─────────────────────────
   const attachmentTags = rumor.tags.filter(t => t[0] === 'attachment')
   const blossomTags = rumor.tags.filter(t => t[0] === 'blossom')
-  const blossomUrls = blossomTags.flatMap(t => t.slice(1)).concat(config.blossomServers)
+  const blossomUrls = blossomTags
+    .flatMap(t => t.slice(1))
+    .map(url => sanitizeHttpUrl(url))
+    .filter((url): url is string => typeof url === 'string')
+    .concat(config.blossomServers.map(url => sanitizeHttpUrl(url)).filter((url): url is string => typeof url === 'string'))
 
   let downloadedAttachments: MimeAttachment[] = []
   if (attachmentTags.length > 0) {
@@ -328,7 +343,12 @@ async function processGiftWrap(
   email.to = emailRecipients
 
   // Generate a proper Message-ID
-  email.messageId = generateMessageId(event.id, config.domain)
+  try {
+    email.messageId = generateMessageId(event.id, config.domain)
+  } catch (err) {
+    console.warn('[outbound] Invalid Message-ID event id:', err)
+    return
+  }
 
   // ── Step 11: Send via SMTP ────────────────────────────────────────────
   try {
@@ -370,15 +390,4 @@ async function sendEmail(email: OutboundEmail): Promise<void> {
 
   const info = await transport.sendMail(mailOptions)
   console.log(`[outbound] Message sent: ${info.messageId}`)
-}
-
-/**
- * Convert a hex string to Uint8Array.
- */
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  return bytes
 }

@@ -4,6 +4,12 @@
 // storage for production use).
 
 import type { ResolvedIdentity, IdentityMapping } from './types.js'
+import {
+  isSafeHex64,
+  sanitizeDomainName,
+  sanitizeEmailAddress,
+  sanitizeMessageId,
+} from './security.js'
 
 // ─── In-Memory Identity Database ────────────────────────────────────────────
 
@@ -32,16 +38,20 @@ const messageIdMap = new Map<string, string>()
  * @returns Resolved identity with pubkey and relays, or null if unresolvable.
  */
 export async function resolveEmailToNostr(email: string): Promise<ResolvedIdentity | null> {
+  const normalizedEmail = sanitizeEmailAddress(email)
+  if (!normalizedEmail) return null
+
   // Check cache first
-  const cached = emailToNostrMap.get(email.toLowerCase())
+  const cached = emailToNostrMap.get(normalizedEmail)
   if (cached) return cached
 
   // Parse email address
-  const atIndex = email.lastIndexOf('@')
+  const atIndex = normalizedEmail.lastIndexOf('@')
   if (atIndex === -1) return null
 
-  const user = email.slice(0, atIndex).toLowerCase()
-  const domain = email.slice(atIndex + 1).toLowerCase()
+  const user = normalizedEmail.slice(0, atIndex)
+  const domain = sanitizeDomainName(normalizedEmail.slice(atIndex + 1))
+  if (!domain) return null
 
   // Attempt NIP-05 resolution
   try {
@@ -70,7 +80,7 @@ export async function resolveEmailToNostr(email: string): Promise<ResolvedIdenti
     }
 
     // Cache the result
-    emailToNostrMap.set(email.toLowerCase(), identity)
+    emailToNostrMap.set(normalizedEmail, identity)
     return identity
 
   } catch {
@@ -91,6 +101,15 @@ export async function resolveEmailToNostr(email: string): Promise<ResolvedIdenti
  * @returns Email address for the pubkey.
  */
 export function resolveNostrToEmail(pubkey: string, bridgeDomain: string): string {
+  if (!isSafeHex64(pubkey)) {
+    throw new Error('Invalid NOSTR pubkey')
+  }
+
+  const safeDomain = sanitizeDomainName(bridgeDomain)
+  if (!safeDomain) {
+    throw new Error('Invalid bridge domain')
+  }
+
   // Check registered mapping
   const mapping = nostrToEmailMap.get(pubkey)
   if (mapping) {
@@ -99,7 +118,7 @@ export function resolveNostrToEmail(pubkey: string, bridgeDomain: string): strin
   }
 
   // Generate deterministic address from pubkey (first 20 hex chars)
-  return `${pubkey.slice(0, 20)}@${bridgeDomain}`
+  return `${pubkey.slice(0, 20)}@${safeDomain}`
 }
 
 /**
@@ -113,17 +132,26 @@ export function resolveNostrToEmail(pubkey: string, bridgeDomain: string): strin
  * @param emailAddress - Assigned email address.
  */
 export function registerBridgeUser(pubkey: string, emailAddress: string): void {
+  if (!isSafeHex64(pubkey)) {
+    throw new Error('Invalid NOSTR pubkey')
+  }
+
+  const normalizedEmail = sanitizeEmailAddress(emailAddress)
+  if (!normalizedEmail) {
+    throw new Error('Invalid bridge email address')
+  }
+
   const now = Math.floor(Date.now() / 1000)
 
   nostrToEmailMap.set(pubkey, {
     pubkey,
-    emailAddress: emailAddress.toLowerCase(),
+    emailAddress: normalizedEmail,
     createdAt: now,
     lastUsedAt: now,
   })
 
   // Reverse mapping for inbound resolution
-  emailToNostrMap.set(emailAddress.toLowerCase(), {
+  emailToNostrMap.set(normalizedEmail, {
     pubkey,
     relays: [],
     nip05: undefined,
@@ -141,7 +169,10 @@ export function registerBridgeUser(pubkey: string, emailAddress: string): void {
  * @param eventId - NOSTR event ID.
  */
 export function storeMessageIdMapping(messageId: string, eventId: string): void {
-  messageIdMap.set(messageId, eventId)
+  const normalizedMessageId = sanitizeMessageId(messageId)
+  if (!normalizedMessageId || !isSafeHex64(eventId)) return
+
+  messageIdMap.set(normalizedMessageId, eventId)
 }
 
 /**
@@ -151,7 +182,10 @@ export function storeMessageIdMapping(messageId: string, eventId: string): void 
  * @returns NOSTR event ID, or undefined if not found.
  */
 export async function resolveMessageId(messageId: string): Promise<string | undefined> {
-  return messageIdMap.get(messageId)
+  const normalizedMessageId = sanitizeMessageId(messageId)
+  if (!normalizedMessageId) return undefined
+
+  return messageIdMap.get(normalizedMessageId)
 }
 
 /**
@@ -165,7 +199,16 @@ export async function resolveMessageId(messageId: string): Promise<string | unde
  * @returns Generated Message-ID.
  */
 export function generateMessageId(eventId: string, bridgeDomain: string): string {
-  const msgId = `<${eventId}@${bridgeDomain}>`
+  if (!isSafeHex64(eventId)) {
+    throw new Error('Invalid NOSTR event ID')
+  }
+
+  const safeDomain = sanitizeDomainName(bridgeDomain)
+  if (!safeDomain) {
+    throw new Error('Invalid bridge domain')
+  }
+
+  const msgId = `<${eventId}@${safeDomain}>`
   messageIdMap.set(msgId, eventId)
   return msgId
 }
@@ -185,8 +228,9 @@ export function getRegisteredUsers(): IdentityMapping[] {
  * @returns True if the address belongs to this bridge.
  */
 export function isBridgeAddress(email: string, bridgeDomain: string): boolean {
-  const domain = email.split('@')[1]?.toLowerCase()
-  return domain === bridgeDomain.toLowerCase()
+  const domain = sanitizeDomainName(email.split('@')[1])
+  const safeBridgeDomain = sanitizeDomainName(bridgeDomain)
+  return domain !== null && safeBridgeDomain !== null && domain === safeBridgeDomain
 }
 
 /**

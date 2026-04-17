@@ -6,6 +6,7 @@ import { SMTPServer } from 'smtp-server'
 import { simpleParser } from 'mailparser'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools'
 import * as nip44 from 'nostr-tools/nip44'
+import { createHash } from 'node:crypto'
 import type { BridgeConfig, BridgedMessage, ConversionResult, AuthResults, MailRumor } from './types.js'
 import { mimeToRumor, extractAttachments, htmlToMarkdown, threadingEmailToNostr } from './convert.js'
 import {
@@ -14,6 +15,13 @@ import {
   storeMessageIdMapping,
   fetchInboxRelays,
 } from './identity.js'
+import {
+  sanitizeEmailAddress,
+  sanitizeHeaderValue,
+  parseHexBytes,
+  sanitizeMessageId,
+  sanitizeMessageIdList,
+} from './security.js'
 
 /** Active SMTP server instance. */
 let smtpServer: SMTPServer | null = null
@@ -29,7 +37,7 @@ let smtpServer: SMTPServer | null = null
  * @returns The running SMTP server instance.
  */
 export function startInboundServer(config: BridgeConfig): SMTPServer {
-  const bridgePrivkey = hexToBytes(config.bridgePrivateKeyHex)
+  const bridgePrivkey = parseHexBytes(config.bridgePrivateKeyHex)
   const bridgePubkey = getPublicKey(bridgePrivkey)
 
   smtpServer = new SMTPServer({
@@ -132,12 +140,14 @@ async function processInboundEmail(
     const parsed = await simpleParser(rawEmail)
 
     // ── Step 2: Extract sender info ─────────────────────────────────────
-    const fromAddress = parsed.from?.value[0]?.address
+    const fromAddress = sanitizeEmailAddress(parsed.from?.value[0]?.address)
     if (!fromAddress) {
       return { success: false, error: 'No From address in email', warnings }
     }
 
     const fromName = parsed.from?.value[0]?.name
+      ? sanitizeHeaderValue(parsed.from.value[0].name, 128)
+      : undefined
 
     // ── Step 3: Evaluate authentication (SPF/DKIM/DMARC) ───────────────
     const authResults = evaluateAuthResults(parsed.headers, session.remoteAddress)
@@ -200,27 +210,26 @@ async function processInboundEmail(
     }
 
     // ── Step 7: Resolve email threading to NOSTR threading ──────────────
-    const messageId = parsed.messageId
-    const inReplyTo = parsed.inReplyTo
-    const references = parsed.references
-      ? (Array.isArray(parsed.references) ? parsed.references : [parsed.references])
-      : undefined
+    const messageId = sanitizeMessageId(parsed.messageId ?? undefined) ?? parsed.messageId
+    const inReplyTo = sanitizeMessageId(parsed.inReplyTo ?? undefined) ?? parsed.inReplyTo
+    const references = sanitizeMessageIdList(parsed.references as string[] | string | undefined)
+      .filter(Boolean)
 
     const threadMapping = await threadingEmailToNostr(
       messageId,
       inReplyTo,
-      references,
+      references.length > 0 ? references : undefined,
       resolveMessageId,
     )
 
     // ── Step 8: Build bridged message ───────────────────────────────────
     const bridgedMessage: BridgedMessage = {
       fromEmail: fromAddress,
-      fromName: fromName ?? undefined,
+      fromName,
       toEmails: toAddresses,
       ccEmails: ccAddresses,
       bccEmails: [], // BCC not visible in received headers
-      subject: parsed.subject ?? '',
+      subject: sanitizeHeaderValue(parsed.subject ?? '', 512),
       body,
       contentType,
       attachments,
@@ -256,8 +265,10 @@ async function processInboundEmail(
 
     // ── Step 11: Store Message-ID mapping for future threading ──────────
     if (messageId) {
-      // Use the rumor's created_at + pubkey as a pseudo event ID
-      const pseudoEventId = `${rumor.created_at}-${bridgePubkey.slice(0, 32)}`
+      const pseudoEventId = createHash('sha256')
+        .update(messageId)
+        .update(bridgePubkey)
+        .digest('hex')
       storeMessageIdMapping(messageId, pseudoEventId)
     }
 
@@ -512,10 +523,15 @@ function extractAddresses(field: unknown): string[] {
     return field.flatMap(item => extractAddresses(item))
   }
 
+  if (typeof field === 'string') {
+    const addr = sanitizeEmailAddress(field)
+    return addr ? [addr] : []
+  }
+
   if (typeof field === 'object' && field !== null && 'value' in field) {
     const values = (field as { value: Array<{ address?: string }> }).value
     return values
-      .map(v => v.address)
+      .map(v => sanitizeEmailAddress(v.address))
       .filter((a): a is string => typeof a === 'string')
   }
 
@@ -533,20 +549,16 @@ function extractRelevantHeaders(headers: Map<string, unknown> | undefined): Reco
   for (const key of keep) {
     const val = headers.get(key)
     if (typeof val === 'string') {
-      result[key] = val
+      if (key === 'message-id' || key === 'in-reply-to') {
+        result[key] = sanitizeMessageId(val) ?? sanitizeHeaderValue(val, 512)
+      } else if (key === 'references') {
+        const refs = sanitizeMessageIdList(val)
+        result[key] = refs.length > 0 ? refs.join(' ') : sanitizeHeaderValue(val, 512)
+      } else {
+        result[key] = sanitizeHeaderValue(val, 512)
+      }
     }
   }
 
   return result
-}
-
-/**
- * Convert a hex string to Uint8Array.
- */
-function hexToBytes(hex: string): Uint8Array {
-  const bytes = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
-  }
-  return bytes
 }
