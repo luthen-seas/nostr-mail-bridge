@@ -23,6 +23,50 @@ const activeSubscriptions: WebSocket[] = []
 let transport: Transporter | null = null
 
 /**
+ * LRU of recently-processed outbound gift-wrap event IDs. Bounded to 10 000
+ * entries with a 24h sliding TTL: a `processGiftWrap` invocation for an
+ * `event.id` already in the cache is dropped immediately so we never produce
+ * duplicate SMTP sends if the same kind-1059 event is re-broadcast across
+ * several subscribed relays. We use a Map<id, expiresAtMs> so we can both
+ * preserve insertion-order eviction and cheaply reject expired entries.
+ */
+const OUTBOUND_REPLAY_CAP = 10_000
+const OUTBOUND_REPLAY_TTL_MS = 24 * 60 * 60 * 1000
+const outboundReplayCache = new Map<string, number>()
+
+/**
+ * Returns true if `eventId` has not been seen in the LRU window. Records the
+ * id with a fresh TTL on first sight; returns false (i.e. drop) on replay.
+ *
+ * Exposed for tests (B8) so we can assert the dedup behaviour without spinning
+ * up a relay subscription.
+ */
+export function rememberOutboundEvent(eventId: string): boolean {
+  const now = Date.now()
+  const existing = outboundReplayCache.get(eventId)
+  if (existing !== undefined) {
+    if (existing > now) return false
+    // Expired — refresh as a new entry below.
+    outboundReplayCache.delete(eventId)
+  }
+  outboundReplayCache.set(eventId, now + OUTBOUND_REPLAY_TTL_MS)
+  if (outboundReplayCache.size > OUTBOUND_REPLAY_CAP) {
+    // Map preserves insertion order — the first key is the oldest.
+    const oldest = outboundReplayCache.keys().next().value
+    if (oldest !== undefined) outboundReplayCache.delete(oldest)
+  }
+  return true
+}
+
+/**
+ * Test-only helper: clear the LRU between cases so tests don't see leakage
+ * from earlier suites. Not part of the runtime contract.
+ */
+export function _resetOutboundReplayCache(): void {
+  outboundReplayCache.clear()
+}
+
+/**
  * Start the outbound NOSTR -> SMTP subscriber.
  *
  * Connects to configured relays, subscribes to kind 1059 events tagged
@@ -172,7 +216,7 @@ function connectAndSubscribe(
  * @param bridgePubkey - Bridge public key hex.
  * @param config - Bridge configuration.
  */
-async function processGiftWrap(
+export async function processGiftWrap(
   event: {
     kind: number
     pubkey: string
@@ -186,6 +230,15 @@ async function processGiftWrap(
   _bridgePubkey: string,
   config: BridgeConfig,
 ): Promise<void> {
+  // ── Step 0: Replay drop ────────────────────────────────────────────────
+  // The same kind-1059 event commonly arrives from every relay we are
+  // subscribed to. Without this guard we'd send N SMTP messages for one
+  // intended delivery. The check is keyed on `event.id` because the gift
+  // wrap is signed and its id is content-addressed.
+  if (!rememberOutboundEvent(event.id)) {
+    return
+  }
+
   // ── Step 1: Verify the gift wrap event signature ──────────────────────
   if (!verifyEvent(event)) {
     console.warn('[outbound] Invalid gift wrap signature, discarding')
@@ -313,7 +366,19 @@ async function processGiftWrap(
   }
 
   // ── Step 9: Download attachments from Blossom ─────────────────────────
+  // We also gather `attachment-key` tags so that the (encrypted) Blossom
+  // blob can be decrypted back to plaintext before being MIME-encoded into
+  // the outbound email. This pairs with the wave-1 inbound encryption.
   const attachmentTags = rumor.tags.filter(t => t[0] === 'attachment')
+  const attachmentKeys = new Map<string, string>()
+  for (const t of rumor.tags) {
+    if (t[0] !== 'attachment-key') continue
+    const hash = t[1]
+    const key = t[2]
+    if (typeof hash === 'string' && typeof key === 'string' && /^[0-9a-fA-F]{64}$/.test(key)) {
+      attachmentKeys.set(hash, key)
+    }
+  }
   const blossomTags = rumor.tags.filter(t => t[0] === 'blossom')
   const blossomUrls = blossomTags
     .flatMap(t => t.slice(1))
@@ -324,7 +389,7 @@ async function processGiftWrap(
   let downloadedAttachments: MimeAttachment[] = []
   if (attachmentTags.length > 0) {
     try {
-      downloadedAttachments = await buildMimeAttachments(attachmentTags, blossomUrls)
+      downloadedAttachments = await buildMimeAttachments(attachmentTags, blossomUrls, attachmentKeys)
     } catch (err) {
       console.warn('[outbound] Attachment download failed:', err)
     }

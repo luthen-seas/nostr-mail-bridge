@@ -3,6 +3,8 @@
 // Maintains an in-memory identity mapping database (replace with persistent
 // storage for production use).
 
+import { writeFileSync, renameSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import type { ResolvedIdentity, IdentityMapping } from './types.js'
 import {
   isSafeHex64,
@@ -10,8 +12,9 @@ import {
   sanitizeEmailAddress,
   sanitizeMessageId,
 } from './security.js'
+import { assertPublicUrl } from './ssrf.js'
 
-// ─── In-Memory Identity Database ────────────────────────────────────────────
+// ─── Identity Database (in-memory, optionally file-backed) ───────────────────
 
 /** Email -> NOSTR pubkey mapping (NIP-05 resolved). */
 const emailToNostrMap = new Map<string, ResolvedIdentity>()
@@ -21,6 +24,60 @@ const nostrToEmailMap = new Map<string, IdentityMapping>()
 
 /** Email Message-ID -> NOSTR event ID mapping (for threading). */
 const messageIdMap = new Map<string, string>()
+
+// ─── Persistence (F-BRIDGE-DOS-01) ───────────────────────────────────────────
+// When BRIDGE_IDENTITY_STORE is set, the pubkey↔email registry is persisted to
+// a JSON file so a restart does not silently re-issue users' deterministic
+// fallback addresses. Writes are atomic (temp file + rename). Absent ⇒ the
+// previous in-memory-only behavior (fine for dev).
+
+let identityStorePath: string | null = null
+
+/**
+ * Initialize the identity store from BRIDGE_IDENTITY_STORE (or an explicit
+ * path). Loads existing registrations into memory. Safe to call once at
+ * startup; a missing file is not an error.
+ */
+export function initIdentityStore(path?: string): void {
+  identityStorePath = path ?? process.env['BRIDGE_IDENTITY_STORE'] ?? null
+  if (!identityStorePath || !existsSync(identityStorePath)) return
+  try {
+    const data = JSON.parse(readFileSync(identityStorePath, 'utf-8')) as {
+      registrations?: IdentityMapping[]
+    }
+    for (const m of data.registrations ?? []) {
+      if (!isSafeHex64(m.pubkey)) continue
+      const email = sanitizeEmailAddress(m.emailAddress)
+      if (!email) continue
+      nostrToEmailMap.set(m.pubkey, { ...m, emailAddress: email })
+      emailToNostrMap.set(email, { pubkey: m.pubkey, relays: [], nip05: undefined })
+    }
+  } catch (err) {
+    console.warn(`[identity] failed to load store ${identityStorePath}: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+}
+
+/** Atomically persist the registry. No-op when no store path is configured. */
+function persistIdentityStore(): void {
+  if (!identityStorePath) return
+  try {
+    mkdirSync(dirname(identityStorePath), { recursive: true })
+    const payload = JSON.stringify({ registrations: [...nostrToEmailMap.values()] })
+    const tmp = `${identityStorePath}.tmp`
+    writeFileSync(tmp, payload, 'utf-8')
+    renameSync(tmp, identityStorePath)
+  } catch (err) {
+    console.warn(`[identity] failed to persist store: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+}
+
+/** Test helper: reset all in-memory identity maps and store path. */
+export function _resetIdentityStoreForTests(): void {
+  emailToNostrMap.clear()
+  nostrToEmailMap.clear()
+  messageIdMap.clear()
+  identityStorePath = null
+}
 
 // ─── NIP-05 Resolution ─────────────────────────────────────────────────────
 
@@ -56,6 +113,10 @@ export async function resolveEmailToNostr(email: string): Promise<ResolvedIdenti
   // Attempt NIP-05 resolution
   try {
     const url = `https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(user)}`
+    // SSRF guard (F-SSRF-01): the domain is attacker-controlled (it comes from
+    // an inbound envelope recipient). Reject any host that resolves to a
+    // private / loopback / link-local / metadata range before we fetch.
+    await assertPublicUrl(url, ['https:'])
     const response = await fetch(url, {
       signal: AbortSignal.timeout(10000),
       headers: { 'Accept': 'application/json' },
@@ -156,6 +217,9 @@ export function registerBridgeUser(pubkey: string, emailAddress: string): void {
     relays: [],
     nip05: undefined,
   })
+
+  // Persist the registry so the mapping survives a restart (F-BRIDGE-DOS-01).
+  persistIdentityStore()
 }
 
 /**
@@ -234,23 +298,81 @@ export function isBridgeAddress(email: string, bridgeDomain: string): boolean {
 }
 
 /**
- * Fetch inbox relays for a pubkey via NIP-65 (kind 10002).
+ * Fetch inbox relays for a pubkey via NIP-17 kind 10050 (DM Relay List).
  *
- * In production, this queries relays for the user's kind 10002 event
- * and extracts relay URLs tagged as read/inbox. For the reference
- * implementation, we return an empty array (callers should fall back
- * to default relays).
+ * Per NIP-17, kind 10050 events list the relays where a user expects to
+ * receive gift-wrapped DMs/mail. We query a known fallback relay over a
+ * one-shot WebSocket subscription, parse the `relay` tags from the
+ * returned event, and return them. On error, timeout, or empty result we
+ * return _defaultRelays.
  *
  * @param pubkey - Hex public key.
- * @param _defaultRelays - Fallback relay URLs.
+ * @param _defaultRelays - Fallback relay URLs (also used as bootstrap).
  * @returns Array of inbox relay URLs.
  */
 export async function fetchInboxRelays(pubkey: string, _defaultRelays: string[]): Promise<string[]> {
-  // In production, query kind 10002 events for this pubkey.
-  // For reference implementation, return defaults.
+  // 1) Local cache hit (e.g. populated by registerBridgeUser).
   const identity = emailToNostrMap.get(pubkey)
   if (identity && identity.relays.length > 0) {
     return identity.relays
   }
-  return _defaultRelays
+  if (!isSafeHex64(pubkey) || _defaultRelays.length === 0) {
+    return _defaultRelays
+  }
+
+  // 2) Live lookup against the first reachable bootstrap relay.
+  const bootstrap = _defaultRelays[0]
+  if (typeof bootstrap !== 'string') return _defaultRelays
+  return new Promise<string[]>((resolve) => {
+    let settled = false
+    const done = (value: string[]) => {
+      if (settled) return
+      settled = true
+      try { ws.close() } catch { /* ignore */ }
+      resolve(value)
+    }
+    let ws: WebSocket
+    try {
+      ws = new WebSocket(bootstrap)
+    } catch {
+      resolve(_defaultRelays)
+      return
+    }
+    const timer = setTimeout(() => done(_defaultRelays), 5000)
+    const subId = `inbox-${Math.random().toString(36).slice(2, 10)}`
+    ws.onopen = () => {
+      const req = JSON.stringify(['REQ', subId, { authors: [pubkey], kinds: [10050], limit: 1 }])
+      ws.send(req)
+    }
+    ws.onmessage = (msg) => {
+      try {
+        const data = JSON.parse(String(msg.data))
+        if (Array.isArray(data) && data[0] === 'EVENT' && data[1] === subId && data[2]) {
+          const event = data[2] as { tags?: unknown }
+          const tags = Array.isArray(event.tags) ? event.tags : []
+          const relays: string[] = []
+          for (const tag of tags) {
+            if (Array.isArray(tag) && tag[0] === 'relay' && typeof tag[1] === 'string') {
+              relays.push(tag[1])
+            }
+          }
+          clearTimeout(timer)
+          done(relays.length > 0 ? relays : _defaultRelays)
+        } else if (Array.isArray(data) && data[0] === 'EOSE' && data[1] === subId) {
+          clearTimeout(timer)
+          done(_defaultRelays)
+        }
+      } catch {
+        // Ignore parse errors on non-EVENT messages.
+      }
+    }
+    ws.onerror = () => {
+      clearTimeout(timer)
+      done(_defaultRelays)
+    }
+    ws.onclose = () => {
+      clearTimeout(timer)
+      done(_defaultRelays)
+    }
+  })
 }

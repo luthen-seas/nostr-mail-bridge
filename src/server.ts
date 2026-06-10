@@ -3,10 +3,12 @@
 // and HTTP health-check endpoint. Handles graceful shutdown.
 
 import http from 'node:http'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { generateSecretKey, getPublicKey } from 'nostr-tools'
 import type { BridgeConfig } from './types.js'
 import { startInboundServer, stopInboundServer } from './inbound.js'
 import { startOutboundSubscriber, stopOutboundSubscriber } from './outbound.js'
+import { registerBridgeUser, initIdentityStore } from './identity.js'
 import {
   parseHexBytes,
   sanitizeDomainName,
@@ -17,6 +19,9 @@ import {
 
 /** Health-check HTTP server. */
 let healthServer: http.Server | null = null
+
+/** Admin provisioning HTTP server (only started when BRIDGE_ADMIN_TOKEN set). */
+let adminServer: http.Server | null = null
 
 /** Server start time for uptime reporting. */
 let startTime: number = 0
@@ -75,10 +80,22 @@ function loadConfig(): BridgeConfig {
     .map(s => sanitizeHttpUrl(s))
     .filter((s): s is string => typeof s === 'string')
 
-  const outboundAuth = process.env['OUTBOUND_SMTP_USER']
+  // B7: outbound auth empty-pass fail-fast.
+  // If a user is configured but the password is empty, fail at startup
+  // rather than silently constructing an `auth: { user, pass: "" }` config
+  // that some SMTP servers misinterpret.
+  const outboundUser = process.env['OUTBOUND_SMTP_USER']
+  const outboundPass = process.env['OUTBOUND_SMTP_PASS']
+  if (outboundUser && !outboundPass) {
+    throw new Error(
+      'OUTBOUND_SMTP_USER is set but OUTBOUND_SMTP_PASS is empty. ' +
+        'Either set both (for AUTH-required submission) or unset both (for anonymous outbound).',
+    )
+  }
+  const outboundAuth = outboundUser
     ? {
-        user: process.env['OUTBOUND_SMTP_USER']!,
-        pass: process.env['OUTBOUND_SMTP_PASS'] ?? '',
+        user: outboundUser,
+        pass: outboundPass!,
       }
     : undefined
 
@@ -100,7 +117,12 @@ function loadConfig(): BridgeConfig {
     },
     healthPort: parseInt(process.env['HEALTH_PORT'] ?? '8080', 10),
     maxMessageSize: parseInt(process.env['MAX_MESSAGE_SIZE'] ?? '26214400', 10),
-    requireAuth: process.env['REQUIRE_AUTH'] === 'true',
+    // F-DKIM-01: fail-closed by default. Operators must explicitly opt out
+    // (REQUIRE_AUTH=false) to accept unauthenticated inbound mail.
+    requireAuth: process.env['REQUIRE_AUTH'] !== 'false',
+    trustedAuthservId: process.env['TRUSTED_AUTHSERV_ID']
+      ? sanitizeHeaderValue(process.env['TRUSTED_AUTHSERV_ID'], 253)
+      : undefined,
   }
 }
 
@@ -113,6 +135,17 @@ function requireEnv(name: string): string {
     throw new Error(`Required environment variable ${name} is not set`)
   }
   return value
+}
+
+/**
+ * Constant-time string comparison (F-BRIDGE-DOS-01). Both sides are hashed to
+ * a fixed-length digest first so neither the length nor the content of the
+ * secret leaks through comparison timing.
+ */
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ha = createHash('sha256').update(a).digest()
+  const hb = createHash('sha256').update(b).digest()
+  return timingSafeEqual(ha, hb)
 }
 
 /**
@@ -151,6 +184,85 @@ function startHealthServer(config: BridgeConfig): void {
 }
 
 /**
+ * Start the admin provisioning HTTP server.
+ *
+ * Endpoint: `POST /admin/users` with header `Authorization: Bearer <token>`
+ * and JSON body `{pubkey, email}` calls `registerBridgeUser`. The endpoint
+ * is only started when `BRIDGE_ADMIN_TOKEN` is set in the environment.
+ *
+ * Returns:
+ *  - 401 on missing/wrong token
+ *  - 400 on malformed body
+ *  - 200 with `{ok:true}` on success
+ *  - 500 on internal error
+ *
+ * Every successful registration is logged to stdout (audit trail).
+ */
+function startAdminServer(_config: BridgeConfig): void {
+  const adminToken = process.env['BRIDGE_ADMIN_TOKEN']
+  if (!adminToken) {
+    console.log('[admin] BRIDGE_ADMIN_TOKEN unset; admin endpoint disabled')
+    return
+  }
+  const adminPort = parseInt(process.env['BRIDGE_ADMIN_PORT'] ?? '8025', 10)
+
+  adminServer = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/admin/users') {
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'not found' }))
+      return
+    }
+    const authHeader = req.headers['authorization']
+    // F-BRIDGE-DOS-01: constant-time comparison to avoid a timing oracle on
+    // the admin token.
+    if (typeof authHeader !== 'string' || !timingSafeEqualStr(authHeader, `Bearer ${adminToken}`)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'unauthorized' }))
+      return
+    }
+    const chunks: Buffer[] = []
+    req.on('data', (c: Buffer) => chunks.push(c))
+    req.on('end', () => {
+      let body: { pubkey?: unknown; email?: unknown }
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'invalid JSON body' }))
+        return
+      }
+      if (typeof body.pubkey !== 'string' || typeof body.email !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'pubkey and email must be strings' }))
+        return
+      }
+      try {
+        registerBridgeUser(body.pubkey, body.email)
+        const remote = req.socket.remoteAddress ?? 'unknown'
+        // Audit log — do NOT log the token itself.
+        console.log(`[admin] registered pubkey=${body.pubkey.slice(0, 8)}... email=${body.email} from=${remote}`)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error'
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: msg }))
+      }
+    })
+    req.on('error', () => {
+      try {
+        res.writeHead(500, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'request error' }))
+      } catch { /* ignore */ }
+    })
+  })
+
+  adminServer.listen(adminPort, '127.0.0.1', () => {
+    console.log(`[admin] Provisioning endpoint on http://127.0.0.1:${adminPort}/admin/users (token-gated)`)
+  })
+}
+
+/**
  * Gracefully shut down all bridge components.
  */
 async function shutdown(): Promise<void> {
@@ -168,6 +280,13 @@ async function shutdown(): Promise<void> {
   if (healthServer) {
     shutdownPromises.push(new Promise((resolve) => {
       healthServer!.close(() => resolve())
+    }))
+  }
+
+  // Close admin server (if running)
+  if (adminServer) {
+    shutdownPromises.push(new Promise((resolve) => {
+      adminServer!.close(() => resolve())
     }))
   }
 
@@ -189,6 +308,10 @@ async function main(): Promise<void> {
     const config = loadConfig()
     startTime = Date.now()
 
+    // Load persisted identity registrations (F-BRIDGE-DOS-01) so bridge
+    // addresses survive restarts. No-op unless BRIDGE_IDENTITY_STORE is set.
+    initIdentityStore()
+
     const bridgePubkey = getPublicKey(parseHexBytes(config.bridgePrivateKeyHex))
     console.log(`[config] Domain: ${config.domain}`)
     console.log(`[config] Bridge pubkey: ${bridgePubkey}`)
@@ -199,6 +322,7 @@ async function main(): Promise<void> {
     startInboundServer(config)
     startOutboundSubscriber(config)
     startHealthServer(config)
+    startAdminServer(config)
 
     console.log('[bridge] All components started successfully')
 
