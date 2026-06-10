@@ -3,6 +3,7 @@
 // Handles: HTML<->Markdown, threading mapping, attachment extraction/building.
 
 import type { ParsedMail } from 'mailparser'
+import { createDecipheriv } from 'node:crypto'
 import type {
   MailRumor,
   BufferAttachment,
@@ -21,6 +22,10 @@ import {
   sanitizeMimeType,
   sanitizeHttpUrl,
 } from './security.js'
+import { assertPublicUrl } from './ssrf.js'
+
+/** Maximum size of a single downloaded Blossom blob (F-DLOAD / F-SSRF-02). */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
 // ─── HTML <-> Markdown Conversion ───────────────────────────────────────────
 
@@ -231,7 +236,7 @@ export function mimeToRumor(
   message: BridgedMessage,
   senderPubkey: string,
   recipientMappings: Map<string, { pubkey: string; relay?: string }>,
-  attachmentHashes: Map<string, { hash: string; size: number }>,
+  attachmentHashes: Map<string, { hash: string; size: number; key?: string }>,
   threadMapping?: { replyTo?: string; threadRoot?: string },
 ): MailRumor {
   if (!isSafeHex64(senderPubkey)) {
@@ -272,10 +277,17 @@ export function mimeToRumor(
   }
 
   // Attachments
+  // Per wave-1 hardening: attachments are AES-256-GCM encrypted before upload
+  // to public Blossom hosts. The recipient needs the symmetric key, which is
+  // shipped inside the encrypted rumor as ["attachment-key", hash, hexKey].
+  // The recipient correlates the key to the blob by its sha256 hash.
   for (const att of message.attachments) {
     const uploaded = attachmentHashes.get(att.filename)
     if (uploaded) {
       tags.push(['attachment', uploaded.hash, att.filename, att.mimeType, String(uploaded.size)])
+      if (uploaded.key) {
+        tags.push(['attachment-key', uploaded.hash, uploaded.key])
+      }
     }
   }
 
@@ -516,18 +528,52 @@ export function extractAttachments(parsedMail: ParsedMail): BufferAttachment[] {
 }
 
 /**
+ * Decrypt an attachment blob produced by the inbound encryptAttachment helper.
+ *
+ * The blob layout is `iv (12B) || ciphertext || authTag (16B)` and the key
+ * must be a 32-byte AES-256 key supplied as the hex string from the
+ * `attachment-key` tag. Throws on malformed input or auth-tag mismatch.
+ *
+ * Exported so the outbound path AND tests can round-trip the wave-1 cipher.
+ */
+export function decryptAttachment(blob: Uint8Array, keyHex: string): Buffer {
+  if (!/^[0-9a-fA-F]{64}$/.test(keyHex)) {
+    throw new Error('attachment-key must be 32 bytes (64 hex chars)')
+  }
+  if (blob.length < 12 + 16) {
+    throw new Error('encrypted attachment shorter than minimum (iv+tag)')
+  }
+  const iv = blob.slice(0, 12)
+  const tag = blob.slice(blob.length - 16)
+  const ct = blob.slice(12, blob.length - 16)
+  const key = Buffer.from(keyHex, 'hex')
+  const decipher = createDecipheriv('aes-256-gcm', key, iv)
+  decipher.setAuthTag(Buffer.from(tag))
+  const pt = Buffer.concat([decipher.update(Buffer.from(ct)), decipher.final()])
+  // Best-effort wipe of the standalone key buffer.
+  key.fill(0)
+  return pt
+}
+
+/**
  * Build MIME attachment structures from Blossom-hosted file references.
  *
  * Downloads files from Blossom servers and creates MIME-compatible
- * attachment objects for nodemailer.
+ * attachment objects for nodemailer. When a corresponding `attachment-key`
+ * tag is provided for a given hash, the blob is decrypted before being
+ * MIME-encoded — this is the reciprocal of the wave-1 inbound encryption.
+ * If no key is present (legacy peer or cleartext blob) the blob is passed
+ * through unchanged with a console warning.
  *
  * @param attachmentTags - Attachment tags from the rumor.
  * @param blossomUrls - Blossom server URLs to try.
+ * @param attachmentKeys - Map of sha256 hash -> hex key from `attachment-key` tags.
  * @returns Array of MimeAttachment objects ready for nodemailer.
  */
 export async function buildMimeAttachments(
   attachmentTags: string[][],
   blossomUrls: string[],
+  attachmentKeys?: Map<string, string>,
 ): Promise<MimeAttachment[]> {
   const attachments: MimeAttachment[] = []
 
@@ -548,24 +594,50 @@ export async function buildMimeAttachments(
         if (!safeBase) continue
 
         const url = `${safeBase}/${hash}`
+        // F-SSRF-02: blossom URLs come from the (attacker-authored) rumor.
+        // Reject hosts that resolve to private/metadata ranges before fetch.
+        await assertPublicUrl(url, ['http:', 'https:'])
         const response = await fetch(url, { signal: AbortSignal.timeout(30000) })
         if (response.ok) {
-          data = new Uint8Array(await response.arrayBuffer())
+          // F-DLOAD: cap the download so a malicious Blossom server cannot
+          // exhaust memory with an unbounded body.
+          const declared = Number(response.headers.get('content-length') ?? '0')
+          if (declared > MAX_ATTACHMENT_BYTES) continue
+          const buf = new Uint8Array(await response.arrayBuffer())
+          if (buf.byteLength > MAX_ATTACHMENT_BYTES) continue
+          data = buf
           break
         }
       } catch {
-        // Try next server
+        // Try next server (includes BlockedHostError from the SSRF guard)
         continue
       }
     }
 
-    if (data) {
-      attachments.push({
-        filename,
-        content: data,
-        contentType: mimeType,
-      })
+    if (!data) continue
+
+    let content: Uint8Array | Buffer = data
+    const keyHex = attachmentKeys?.get(hash)
+    if (keyHex) {
+      try {
+        content = decryptAttachment(data, keyHex)
+      } catch (err) {
+        // If decryption fails the blob is unusable — skip rather than
+        // attaching ciphertext to the email.
+        console.warn(`[outbound] Attachment decryption failed for ${hash}:`, err)
+        continue
+      }
+    } else {
+      console.warn(
+        `[outbound] No attachment-key for ${hash} — passing through cleartext (legacy/peer not on wave-1 spec)`,
+      )
     }
+
+    attachments.push({
+      filename,
+      content,
+      contentType: mimeType,
+    })
   }
 
   return attachments

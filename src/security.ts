@@ -2,6 +2,8 @@
 // Conservative normalizers for headers, addresses, IDs, filenames, MIME
 // types, and relay / Blossom URLs.
 
+import { isIP } from 'node:net'
+
 const SAFE_EMAIL_ADDRESS = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+$/i
 const SAFE_HEX64 = /^[0-9a-f]{64}$/i
 const SAFE_MIME_TYPE = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/
@@ -129,7 +131,14 @@ export function sanitizeDomainName(value: string | undefined): string | null {
   if (!value) return null
 
   const cleaned = sanitizeHeaderValue(value, 253).toLowerCase()
-  return SAFE_DOMAIN_NAME.test(cleaned) ? cleaned : null
+  if (!SAFE_DOMAIN_NAME.test(cleaned)) return null
+  // Reject IP literals (incl. decimal-encoded IPv4 like "2130706433") and the
+  // localhost name — a NIP-05/bridge domain must be a real DNS name, not an
+  // address (defense in depth alongside the ssrf.ts resolution guard).
+  if (isIP(cleaned) !== 0) return null
+  if (/^\d+$/.test(cleaned.replace(/\./g, ''))) return null
+  if (cleaned === 'localhost' || cleaned.endsWith('.localhost')) return null
+  return cleaned
 }
 
 /** Allow only ws/wss relay URLs. */

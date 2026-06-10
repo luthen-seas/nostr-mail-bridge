@@ -34,8 +34,21 @@ export interface BridgeConfig {
   /** Maximum inbound message size in bytes (default: 25MB). */
   maxMessageSize: number
 
-  /** Whether to require SPF/DKIM pass for inbound mail. */
+  /**
+   * Whether to require authenticated, DMARC-aligned inbound mail.
+   * Defaults to `true` (fail-closed) — see F-DKIM-01. When enabled the bridge
+   * verifies SPF/DKIM/DMARC locally (via mailauth) and rejects mail that does
+   * not produce a DMARC `pass`.
+   */
   requireAuth: boolean
+
+  /**
+   * Optional authserv-id of a trusted upstream MTA. When set, the bridge will
+   * additionally honor a matching upstream `Authentication-Results:` header
+   * (RFC 8601) as a fallback. Leave unset for the default local-verification
+   * model. Never trust upstream headers unless this is configured.
+   */
+  trustedAuthservId?: string
 }
 
 /** SMTP transport configuration for outbound email. */

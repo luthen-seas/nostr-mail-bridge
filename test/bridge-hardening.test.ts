@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeEach } from 'vitest'
 import { sanitizeHtml } from '../src/sanitize.js'
 import {
   buildMimeAttachments,
+  decryptAttachment,
   extractAttachments,
   rumorToMime,
   threadingEmailToNostr,
   threadingNostrToEmail,
 } from '../src/convert.js'
+import { encryptAttachment } from '../src/inbound.js'
+import { rememberOutboundEvent, _resetOutboundReplayCache } from '../src/outbound.js'
 
 describe('bridge hardening', () => {
   it('strips dangerous URL schemes and forces safe anchor attributes', () => {
@@ -97,6 +100,48 @@ describe('bridge hardening', () => {
     )
 
     expect(dropped.to).toEqual([])
+  })
+
+  describe('outbound replay LRU (B1)', () => {
+    beforeEach(() => _resetOutboundReplayCache())
+
+    it('admits a fresh event id and rejects the same id on replay', () => {
+      const eventId = 'a'.repeat(64)
+      expect(rememberOutboundEvent(eventId)).toBe(true)
+      // Same id arriving via a different relay → drop.
+      expect(rememberOutboundEvent(eventId)).toBe(false)
+      expect(rememberOutboundEvent(eventId)).toBe(false)
+    })
+
+    it('admits distinct event ids independently', () => {
+      const a = 'a'.repeat(64)
+      const b = 'b'.repeat(64)
+      expect(rememberOutboundEvent(a)).toBe(true)
+      expect(rememberOutboundEvent(b)).toBe(true)
+      expect(rememberOutboundEvent(a)).toBe(false)
+      expect(rememberOutboundEvent(b)).toBe(false)
+    })
+  })
+
+  it('attachment encrypt/decrypt round trip recovers the original bytes (B2)', () => {
+    const plaintext = Buffer.from('the quick brown fox jumps over the lazy dog'.repeat(10))
+    const { blob, keyHex } = encryptAttachment(plaintext)
+    // Wave-1 invariant: blob layout is iv(12) || ct || authTag(16)
+    expect(blob.length).toBe(12 + plaintext.length + 16)
+    expect(/^[0-9a-f]{64}$/.test(keyHex)).toBe(true)
+    const recovered = decryptAttachment(new Uint8Array(blob), keyHex)
+    expect(recovered.equals(plaintext)).toBe(true)
+  })
+
+  it('attachment decrypt rejects authTag tampering', () => {
+    const plaintext = Buffer.from('top-secret-payload')
+    const { blob, keyHex } = encryptAttachment(plaintext)
+    // Flip a bit inside the authentication tag region (last 16 bytes).
+    const tampered = Buffer.from(blob)
+    const tagOff = tampered.length - 1
+    const last = tampered[tagOff]
+    if (last !== undefined) tampered[tagOff] = last ^ 0x01
+    expect(() => decryptAttachment(new Uint8Array(tampered), keyHex)).toThrow()
   })
 
   it('sanitizes attachments and ignores unsafe blossom references', async () => {

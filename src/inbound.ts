@@ -6,7 +6,7 @@ import { SMTPServer } from 'smtp-server'
 import { simpleParser } from 'mailparser'
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools'
 import * as nip44 from 'nostr-tools/nip44'
-import { createHash } from 'node:crypto'
+import { createCipheriv, createHash, randomBytes } from 'node:crypto'
 import type { BridgeConfig, BridgedMessage, ConversionResult, AuthResults, MailRumor } from './types.js'
 import { mimeToRumor, extractAttachments, htmlToMarkdown, threadingEmailToNostr } from './convert.js'
 import {
@@ -21,10 +21,113 @@ import {
   parseHexBytes,
   sanitizeMessageId,
   sanitizeMessageIdList,
+  sanitizeWebSocketUrl,
 } from './security.js'
+import { assertPublicUrl } from './ssrf.js'
 
 /** Active SMTP server instance. */
 let smtpServer: SMTPServer | null = null
+
+/**
+ * Per-IP connection rate limiter. Window: 60s rolling. Default cap: 30 conns.
+ * The cap is intentionally generous for legitimate bursts but tight enough
+ * to throttle a single-source flood. Counts reset every minute.
+ */
+const connectionRate = new Map<string, { count: number; windowStart: number }>()
+const CONN_RATE_WINDOW_MS = 60_000
+const CONN_RATE_MAX = 30
+
+function checkConnRate(ip: string): boolean {
+  const now = Date.now()
+  const entry = connectionRate.get(ip)
+  if (!entry || now - entry.windowStart >= CONN_RATE_WINDOW_MS) {
+    connectionRate.set(ip, { count: 1, windowStart: now })
+    return true
+  }
+  if (entry.count >= CONN_RATE_MAX) return false
+  entry.count++
+  return true
+}
+
+/**
+ * Generic rolling-window rate limiter (F-BRIDGE-DOS-01). Per-IP limits alone
+ * don't bound a single connection that resolves many recipients (each a fresh
+ * outbound NIP-05 fetch → SSRF amplification) or a single sender flooding
+ * messages. These limit by envelope-sender and by recipient.
+ */
+function makeRateLimiter(windowMs: number, max: number) {
+  const buckets = new Map<string, { count: number; windowStart: number }>()
+  return {
+    check(key: string): boolean {
+      const now = Date.now()
+      const entry = buckets.get(key)
+      if (!entry || now - entry.windowStart >= windowMs) {
+        buckets.set(key, { count: 1, windowStart: now })
+        // Opportunistically drop stale buckets to cap memory.
+        if (buckets.size > 50_000) {
+          for (const [k, v] of buckets) {
+            if (now - v.windowStart >= windowMs) buckets.delete(k)
+          }
+        }
+        return true
+      }
+      if (entry.count >= max) return false
+      entry.count++
+      return true
+    },
+    _buckets: buckets,
+  }
+}
+
+const SENDER_RATE_WINDOW_MS = Number(process.env['SENDER_RATE_WINDOW_MS'] ?? 60_000)
+const SENDER_RATE_MAX = Number(process.env['SENDER_RATE_MAX'] ?? 20)
+const RECIPIENT_RATE_WINDOW_MS = Number(process.env['RECIPIENT_RATE_WINDOW_MS'] ?? 60_000)
+const RECIPIENT_RATE_MAX = Number(process.env['RECIPIENT_RATE_MAX'] ?? 30)
+
+const senderRate = makeRateLimiter(SENDER_RATE_WINDOW_MS, SENDER_RATE_MAX)
+const recipientRate = makeRateLimiter(RECIPIENT_RATE_WINDOW_MS, RECIPIENT_RATE_MAX)
+
+/** Exposed for tests. */
+export const _rateLimiters = { senderRate, recipientRate, makeRateLimiter }
+
+/**
+ * LRU of recently-processed inbound messages keyed by raw-email SHA-256.
+ * Bounded to 10_000 entries to cap memory.
+ */
+const inboundReplayCache = new Set<string>()
+const INBOUND_REPLAY_CAP = 10_000
+function rememberInbound(hash: string): boolean {
+  if (inboundReplayCache.has(hash)) return false
+  inboundReplayCache.add(hash)
+  if (inboundReplayCache.size > INBOUND_REPLAY_CAP) {
+    // Evict the oldest insertion (Set preserves insertion order).
+    const oldest = inboundReplayCache.values().next().value
+    if (oldest) inboundReplayCache.delete(oldest)
+  }
+  return true
+}
+
+/**
+ * Encrypt an attachment body with AES-256-GCM under a fresh random key.
+ *
+ * Returns a blob laid out as `iv (12B) || ciphertext || authTag (16B)` and
+ * the hex-encoded 32-byte key. The blob is what gets uploaded to Blossom;
+ * the key is what gets shipped to the recipient inside the encrypted rumor
+ * as the `attachment-key` tag.
+ */
+export function encryptAttachment(plaintext: Buffer): { blob: Buffer; keyHex: string } {
+  const key = randomBytes(32)
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  const ct = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  const tag = cipher.getAuthTag()
+  const blob = Buffer.concat([iv, ct, tag])
+  const keyHex = key.toString('hex')
+  // Best-effort wipe of the standalone key buffer (the hex string is the
+  // canonical carrier from here on).
+  key.fill(0)
+  return { blob, keyHex }
+}
 
 /**
  * Start the inbound SMTP server.
@@ -40,12 +143,42 @@ export function startInboundServer(config: BridgeConfig): SMTPServer {
   const bridgePrivkey = parseHexBytes(config.bridgePrivateKeyHex)
   const bridgePubkey = getPublicKey(bridgePrivkey)
 
+  // Production fail-closed if no TLS material is configured. The user can
+  // override by setting BRIDGE_ALLOW_PLAINTEXT=1 — but in NODE_ENV=production
+  // this is a hard error to prevent DKIM/credential exposure on port 25.
+  if (
+    process.env['NODE_ENV'] === 'production' &&
+    !process.env['BRIDGE_TLS_KEY'] &&
+    !process.env['BRIDGE_TLS_CERT'] &&
+    process.env['BRIDGE_ALLOW_PLAINTEXT'] !== '1'
+  ) {
+    throw new Error(
+      '[inbound] Refusing to start without STARTTLS in production. ' +
+        'Set BRIDGE_TLS_KEY+BRIDGE_TLS_CERT or BRIDGE_ALLOW_PLAINTEXT=1 (development only).',
+    )
+  }
+
   smtpServer = new SMTPServer({
     name: config.hostname,
     size: config.maxMessageSize,
     authOptional: true,
     disabledCommands: ['AUTH'], // No auth needed for inbound relay
     secure: false, // STARTTLS handled separately in production
+    // ── Resource limits (audit-required hardening) ─────────────────────
+    maxClients: 50,
+    closeTimeout: 30_000,
+    socketTimeout: 60_000,
+    // The fields below are valid smtp-server options but missing from
+    // @types/smtp-server in some versions; spread to bypass the type gap.
+    ...({ maxAllowedUnauthenticatedCommands: 10, maxRecipients: 50 } as object),
+
+    onConnect(session, callback) {
+      const ip = (session.remoteAddress ?? 'unknown').toString()
+      if (!checkConnRate(ip)) {
+        return callback(new Error(`421 Too many connections from ${ip}`))
+      }
+      callback()
+    },
 
     onData(stream, session, callback) {
       const chunks: Buffer[] = []
@@ -136,8 +269,24 @@ async function processInboundEmail(
   const warnings: string[] = []
 
   try {
+    // ── Step 0: Replay + loop avoidance ─────────────────────────────────
+    const rawHash = createHash('sha256').update(rawEmail).digest('hex')
+    if (!rememberInbound(rawHash)) {
+      return { success: false, error: 'Duplicate email (replay rejected)', warnings }
+    }
+
     // ── Step 1: Parse MIME ───────────────────────────────────────────────
     const parsed = await simpleParser(rawEmail)
+
+    // Loop avoidance: reject if our own X-Nostr-Bridge header is present.
+    const bridgeMarker = parsed.headers.get('x-nostr-bridge')
+    if (typeof bridgeMarker === 'string' && bridgeMarker.includes('NostrMail-Bridge')) {
+      return {
+        success: false,
+        error: 'X-Nostr-Bridge header present — refusing to bridge a bridged message (loop avoidance)',
+        warnings,
+      }
+    }
 
     // ── Step 2: Extract sender info ─────────────────────────────────────
     const fromAddress = sanitizeEmailAddress(parsed.from?.value[0]?.address)
@@ -145,19 +294,45 @@ async function processInboundEmail(
       return { success: false, error: 'No From address in email', warnings }
     }
 
+    // Loop avoidance: reject if From: is one of our own bridge-managed addrs.
+    const fromDomain = fromAddress.split('@')[1]?.toLowerCase()
+    if (fromDomain === config.domain.toLowerCase()) {
+      return {
+        success: false,
+        error: `From: address ${fromAddress} is in this bridge's domain — refusing to relay (loop avoidance)`,
+        warnings,
+      }
+    }
+
     const fromName = parsed.from?.value[0]?.name
       ? sanitizeHeaderValue(parsed.from.value[0].name, 128)
       : undefined
 
-    // ── Step 3: Evaluate authentication (SPF/DKIM/DMARC) ───────────────
-    const authResults = evaluateAuthResults(parsed.headers, session.remoteAddress)
+    // F-BRIDGE-DOS-01: throttle per envelope-sender (independent of source IP).
+    const envelopeFrom =
+      (session.envelope && typeof session.envelope.mailFrom === 'object'
+        ? sanitizeEmailAddress(session.envelope.mailFrom?.address)
+        : null) ?? fromAddress
+    if (!senderRate.check(envelopeFrom)) {
+      return { success: false, error: `Rate limit exceeded for sender ${envelopeFrom}`, warnings }
+    }
 
-    if (config.requireAuth && authResults.dkim !== 'pass' && authResults.spf !== 'pass') {
+    // ── Step 3: Evaluate authentication (SPF/DKIM/DMARC) ───────────────
+    // F-DKIM-01: verify cryptographically and locally (mailauth) rather than
+    // trusting upstream headers; fall back to a trusted authserv-id only when
+    // explicitly configured. The gate requires a DMARC *pass* (i.e. an aligned
+    // SPF or DKIM), not a bare SPF pass, to prevent From-header spoofing.
+    const authResults = await verifyInboundAuth(rawEmail, session, parsed.headers, config)
+
+    if (config.requireAuth && authResults.dmarc !== 'pass') {
       return {
         success: false,
-        error: `Email authentication failed: SPF=${authResults.spf}, DKIM=${authResults.dkim}`,
+        error: `Inbound authentication failed (DMARC not aligned): SPF=${authResults.spf}, DKIM=${authResults.dkim}, DMARC=${authResults.dmarc}`,
         warnings,
       }
+    }
+    if (authResults.dmarc !== 'pass') {
+      warnings.push(`Inbound mail is not DMARC-aligned (SPF=${authResults.spf}, DKIM=${authResults.dkim}); delivered because requireAuth is disabled`)
     }
 
     // ── Step 4: Resolve recipients to NOSTR pubkeys ─────────────────────
@@ -167,6 +342,12 @@ async function processInboundEmail(
     const resolvedRecipients: Array<{ pubkey: string; relays: string[] }> = []
 
     for (const email of [...toAddresses, ...ccAddresses]) {
+      // F-BRIDGE-DOS-01: bound NIP-05 resolutions per recipient per window
+      // (each resolution is an outbound fetch — limit SSRF amplification).
+      if (!recipientRate.check(email)) {
+        warnings.push(`Rate limit exceeded resolving ${email}; skipped`)
+        continue
+      }
       const resolved = await resolveEmailToNostr(email)
       if (resolved) {
         recipientMappings.set(email, { pubkey: resolved.pubkey, relay: resolved.relays[0] })
@@ -192,15 +373,28 @@ async function processInboundEmail(
       contentType = 'text/plain'
     }
 
-    // ── Step 6: Extract and upload attachments to Blossom ───────────────
+    // ── Step 6: Encrypt + upload attachments to Blossom ─────────────────
+    // Per NIP §"Attachment Encryption" (DEC-009 ripple): files MUST be
+    // encrypted before upload to a public Blossom server. We use AES-256-GCM
+    // with a fresh random key per attachment; the key (hex) is carried in
+    // the encrypted rumor as ["attachment-key", hash, hexKey].
     const attachments = extractAttachments(parsed)
-    const attachmentHashes = new Map<string, { hash: string; size: number }>()
+    const attachmentHashes = new Map<string, { hash: string; size: number; key?: string }>()
 
     for (const att of attachments) {
       try {
-        const uploadResult = await uploadToBlossom(att.data, att.mimeType, config.blossomServers)
+        const encrypted = encryptAttachment(Buffer.from(att.data))
+        const uploadResult = await uploadToBlossom(
+          encrypted.blob,
+          'application/octet-stream',
+          config.blossomServers,
+        )
         if (uploadResult) {
-          attachmentHashes.set(att.filename, uploadResult)
+          attachmentHashes.set(att.filename, {
+            hash: uploadResult.hash,
+            size: uploadResult.size,
+            key: encrypted.keyHex,
+          })
         } else {
           warnings.push(`Failed to upload attachment: ${att.filename}`)
         }
@@ -416,7 +610,27 @@ async function publishToRelays(
 ): Promise<void> {
   const message = JSON.stringify(['EVENT', event])
 
-  const publishPromises = relayUrls.map(async (url) => {
+  // F-SSRF-02: relay URLs may originate from attacker-controlled NIP-05
+  // responses (resolveEmailToNostr → recipient.relays) or kind-10050 tags.
+  // Pass each through the scheme check AND the SSRF resolution guard, so an
+  // attacker cannot steer the bridge's WebSocket at an internal service
+  // (e.g. wss://169.254.169.254 or ws://localhost). Drop unsafe URLs.
+  const safeUrls: string[] = []
+  for (const url of relayUrls) {
+    const safe = sanitizeWebSocketUrl(url)
+    if (typeof safe !== 'string') {
+      console.warn(`[inbound] Skipping malformed relay URL: ${String(url).slice(0, 64)}`)
+      continue
+    }
+    try {
+      await assertPublicUrl(safe, ['ws:', 'wss:'])
+      safeUrls.push(safe)
+    } catch (err) {
+      console.warn(`[inbound] Skipping non-public relay URL ${safe.slice(0, 64)}: ${err instanceof Error ? err.message : 'blocked'}`)
+    }
+  }
+
+  const publishPromises = safeUrls.map(async (url) => {
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         ws.close()
@@ -476,40 +690,118 @@ async function publishToRelays(
 // ─── Helper Functions ───────────────────────────────────────────────────────
 
 /**
- * Evaluate email authentication from headers and session info.
- * Parses Authentication-Results header if present.
+ * Verify inbound authentication (F-DKIM-01).
+ *
+ * Primary path: cryptographically verify SPF/DKIM/DMARC locally via the
+ * `mailauth` package against the raw RFC822 message and the SMTP session
+ * (remote IP + envelope MAIL FROM). This produces our own attestation rather
+ * than trusting whatever an upstream hop claims.
+ *
+ * Fallback path: only when `config.trustedAuthservId` is set do we also honor
+ * a matching upstream `Authentication-Results:` header (for deployments that
+ * sit behind a verifying MTA). The stronger of the two results wins.
  */
-function evaluateAuthResults(
+async function verifyInboundAuth(
+  rawEmail: Buffer,
+  session: { remoteAddress?: string; envelope?: { mailFrom?: false | { address?: string } } },
   headers: Map<string, unknown> | undefined,
-  _remoteAddress?: string,
+  config: BridgeConfig,
+): Promise<AuthResults> {
+  let local: AuthResults = { spf: 'none', dkim: 'none', dmarc: 'none' }
+  try {
+    const { authenticate } = await import('mailauth')
+    const mailFrom =
+      session.envelope && session.envelope.mailFrom && typeof session.envelope.mailFrom === 'object'
+        ? session.envelope.mailFrom.address
+        : undefined
+    const res = (await authenticate(rawEmail, {
+      ip: session.remoteAddress,
+      sender: mailFrom,
+      mta: config.hostname || config.domain,
+    })) as {
+      spf?: { status?: { result?: string } }
+      dmarc?: { status?: { result?: string } }
+      dkim?: { results?: Array<{ status?: { result?: string } }> }
+    }
+    const dkimPass = Array.isArray(res.dkim?.results)
+      ? res.dkim!.results.some((r) => r?.status?.result === 'pass')
+      : false
+    local = {
+      spf: normalizeAuthResult(res.spf?.status?.result, 'spf') as AuthResults['spf'],
+      dkim: (dkimPass ? 'pass' : normalizeAuthResult(res.dkim?.results?.[0]?.status?.result, 'dkim')) as AuthResults['dkim'],
+      dmarc: normalizeAuthResult(res.dmarc?.status?.result, 'dmarc') as AuthResults['dmarc'],
+    }
+  } catch (err) {
+    console.warn(`[inbound] mailauth verification error: ${err instanceof Error ? err.message : 'unknown'}`)
+  }
+
+  // Optional upstream-trust fallback.
+  const upstream = evaluateUpstreamAuthResults(headers, config)
+  return mergeAuthResults(local, upstream)
+}
+
+/** Clamp an arbitrary mailauth result string to our AuthResults enum. */
+function normalizeAuthResult(value: string | undefined, kind: 'spf' | 'dkim' | 'dmarc'): string {
+  const v = (value ?? 'none').toLowerCase()
+  const spfAllowed = ['pass', 'fail', 'softfail', 'neutral', 'none', 'temperror', 'permerror']
+  const allowed = kind === 'spf' ? spfAllowed : ['pass', 'fail', 'none', 'temperror', 'permerror']
+  return allowed.includes(v) ? v : 'none'
+}
+
+/** Take the stronger (pass-wins) of two AuthResults. */
+function mergeAuthResults(a: AuthResults, b: AuthResults): AuthResults {
+  const strongest = (x: string, y: string): string => (x === 'pass' || y === 'pass' ? 'pass' : x !== 'none' ? x : y)
+  return {
+    spf: strongest(a.spf, b.spf) as AuthResults['spf'],
+    dkim: strongest(a.dkim, b.dkim) as AuthResults['dkim'],
+    dmarc: strongest(a.dmarc, b.dmarc) as AuthResults['dmarc'],
+  }
+}
+
+/**
+ * Parse a trusted upstream `Authentication-Results:` header (RFC 8601 §5),
+ * honored only when its authserv-id matches `config.trustedAuthservId`.
+ * Returns all-`none` when no trust is configured.
+ */
+function evaluateUpstreamAuthResults(
+  headers: Map<string, unknown> | undefined,
+  config: BridgeConfig,
 ): AuthResults {
   const defaults: AuthResults = { spf: 'none', dkim: 'none', dmarc: 'none' }
 
   if (!headers) return defaults
+  const trustedAuthservId = config.trustedAuthservId
+  if (!trustedAuthservId) return defaults
 
-  const authHeader = headers.get('authentication-results')
-  if (typeof authHeader !== 'string') return defaults
+  // mailparser exposes a single string for repeated headers (semicolon-joined)
+  // or an array via getAll-style iteration. Iterate every variant we recognise.
+  const candidates: string[] = []
+  const single = headers.get('authentication-results')
+  if (typeof single === 'string') candidates.push(single)
+  // mailparser's `headers` is a Map<string, string|string[]> in current
+  // versions; an array form is possible.
+  if (Array.isArray(single)) {
+    for (const v of single) if (typeof v === 'string') candidates.push(v)
+  }
 
   const results = { ...defaults }
+  for (const header of candidates) {
+    const trimmed = header.trim()
+    // RFC 8601 §2.2: leading authserv-id (token) followed by ';'
+    const semiIdx = trimmed.indexOf(';')
+    const authservId = (semiIdx >= 0 ? trimmed.slice(0, semiIdx) : trimmed)
+      .trim()
+      .split(/\s+/)[0]
+    if (authservId !== trustedAuthservId) continue
 
-  // Parse SPF result
-  const spfMatch = /spf=(pass|fail|softfail|neutral|none|temperror|permerror)/i.exec(authHeader)
-  if (spfMatch?.[1]) {
-    results.spf = spfMatch[1].toLowerCase() as AuthResults['spf']
+    const body = semiIdx >= 0 ? trimmed.slice(semiIdx + 1) : ''
+    const spfMatch = /spf=(pass|fail|softfail|neutral|none|temperror|permerror)/i.exec(body)
+    if (spfMatch?.[1]) results.spf = spfMatch[1].toLowerCase() as AuthResults['spf']
+    const dkimMatch = /dkim=(pass|fail|none|temperror|permerror)/i.exec(body)
+    if (dkimMatch?.[1]) results.dkim = dkimMatch[1].toLowerCase() as AuthResults['dkim']
+    const dmarcMatch = /dmarc=(pass|fail|none|temperror|permerror)/i.exec(body)
+    if (dmarcMatch?.[1]) results.dmarc = dmarcMatch[1].toLowerCase() as AuthResults['dmarc']
   }
-
-  // Parse DKIM result
-  const dkimMatch = /dkim=(pass|fail|none|temperror|permerror)/i.exec(authHeader)
-  if (dkimMatch?.[1]) {
-    results.dkim = dkimMatch[1].toLowerCase() as AuthResults['dkim']
-  }
-
-  // Parse DMARC result
-  const dmarcMatch = /dmarc=(pass|fail|none|temperror|permerror)/i.exec(authHeader)
-  if (dmarcMatch?.[1]) {
-    results.dmarc = dmarcMatch[1].toLowerCase() as AuthResults['dmarc']
-  }
-
   return results
 }
 
